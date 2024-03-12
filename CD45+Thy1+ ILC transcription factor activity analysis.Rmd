@@ -1,0 +1,454 @@
+---
+title: "CD45+Thy1+ ILC transcription factor activity analysis"
+output:
+   html_document: 
+     theme: united
+     df_print: kable
+     toc: yes
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+```{r setup, include = FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+
+# Universal packages
+
+```{r Load packages}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+```
+
+
+# Data input
+
+```{r Load SCT processed data}
+# Load ILC data
+
+# ILC
+ILC <- readRDS("CD45_Thy1_ILC_paper_ver.rds")
+
+
+# Set RNA assay as default
+DefaultAssay(ILC) <- "RNA"
+head(x = ILC[[]])
+```
+
+
+# ILC cluster Visualization
+
+```{r Set Reveal ILC clusters}
+# Show the numbers for ILC
+table(ILC@meta.data$cell_type, split.by = ILC@meta.data$treatment)
+
+# Plot the ILC clusters
+DimPlot(ILC, label = T, repel =  T)
+DimPlot(ILC, group.by = "treatment", label = F) + ggtitle(NULL)
+```
+
+
+# Packages for transcription factor activity inference  analysis
+
+```{r Load package for transcription factor activity analysis}
+# Load the package (decoupleR)
+library(decoupleR)
+
+# Only needed for data handling and plotting
+library(pheatmap)
+```
+
+
+# TF activity inference with Weighted Mean
+
+```{r Load CollecTRI network}
+# Load the database of TFs and their transcriptional targets
+net <- get_collectri(organism='mouse', split_complexes=FALSE)
+
+head(net)
+```
+
+```{r Calculate the pseudotime on averall ILC}
+# Run the Weighted Mean method (wmean)
+# Extract the normalized log-transformed counts
+ILC.mat <- as.matrix(ILC@assays$RNA@data)
+
+# Run wmean
+ILC.acts <- run_wmean(mat=ILC.mat, net=net, .source='source', .target='target',
+                  .mor='mor', times = 100, minsize = 5)
+head(ILC.acts)
+
+# Extract norm_wmean and store it in tfswmean
+ILC[['tfswmean']] <- ILC.acts %>%
+  filter(statistic == 'norm_wmean') %>%
+  pivot_wider(id_cols = 'source', names_from = 'condition',
+              values_from = 'score') %>%
+  column_to_rownames('source') %>%
+  Seurat::CreateAssayObject(.)
+
+# Change assay
+DefaultAssay(object = ILC) <- "tfswmean"
+
+# Scale the data (ILC)
+ILC <- ScaleData(ILC)
+ILC@assays$tfswmean@data <- ILC@assays$tfswmean@scale.data
+```
+
+
+# Split of the data by treatment
+
+```{r Split the data}
+ILC <- SetIdent(ILC, value = "treatment")
+
+# BPC
+BPC <- ILC %>% 
+  subset(idents = c("Alt.BPC"), invert = FALSE) %>%
+  SetIdent(value = "cell_type")
+
+table(BPC@meta.data$cell_type, split.by = BPC@meta.data$treatment)
+
+
+# Alt
+Alt <- ILC %>% 
+  subset(idents = c("Alt"), invert = FALSE) %>%
+  SetIdent(value = "cell_type")
+
+table(Alt@meta.data$cell_type, split.by = Alt@meta.data$treatment)
+```
+
+
+# Exploration of the overall ILC TF activities
+
+```{r TF analysis shared settings}
+# Select top variable TFs
+n_tfs <- 60
+
+# Choose color palette
+palette_length = 100
+my_color = colorRampPalette(c("Darkblue", "white","red"))(palette_length)
+
+my_breaks <- c(seq(-3, 0, length.out=ceiling(palette_length/2) + 1),
+               seq(0.05, 3, length.out=floor(palette_length/2)))
+```
+
+```{r Overall ILC TF exploration split by treatments, fig.width = 12, fig.height = 3}
+# Extract activities from object as a long dataframe
+ILC.df.treatment <- t(as.matrix(ILC@assays$tfswmean@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(ILC)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Get top tfs with more variable means across clusters
+ILC.tfs.treatments <- ILC.df.treatment %>%
+  group_by(source) %>%
+  summarise(std = sd(mean)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+
+# Subset long data frame to top TFs and transform to wide matrix (by treatments)
+top_ILC.acts_mat_treatment <- ILC.df.treatment %>%
+  filter(source %in% ILC.tfs.treatments) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+
+# Plot by treatment
+pheatmap(top_ILC.acts_mat_treatment, border_color = NA, color=my_color, breaks = my_breaks)
+```
+
+```{r Overall ILC TF exploration split by cell types, fig.width = 12, fig.height = 4}
+# Set the primary ident to "cell_type"
+ILC <- SetIdent(ILC, value = "cell_type")
+
+# Extract activities from object as a long dataframe
+ILC.df.cell_type <- t(as.matrix(ILC@assays$tfswmean@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(ILC)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Get top tfs with more variable means across clusters
+ILC.tfs.cell_type <- ILC.df.cell_type %>%
+  group_by(source) %>%
+  summarise(std = sd(mean)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+
+# Subset long data frame to top TFs and transform to wide matrix (by cell types)
+top_ILC.acts_mat_cell_type <- ILC.df.cell_type %>%
+  filter(source %in% ILC.tfs.cell_type) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+
+# Plot by cell types
+pheatmap(top_ILC.acts_mat_cell_type, border_color = NA, color=my_color, breaks = my_breaks)
+```
+
+
+# Exploration of the Alt TF activities
+
+```{r Alt TF exploration, fig.width = 12, fig.height = 4}
+# Extract activities from object as a long dataframe
+Alt.df <- t(as.matrix(Alt@assays$tfswmean@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(Alt)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Get top tfs with more variable means across clusters
+Alt.tfs <- Alt.df %>%
+  group_by(source) %>%
+  summarise(std = sd(mean)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+
+# Subset long data frame to top TFs and transform to wide matrix
+top_Alt.acts_mat <- Alt.df %>%
+  filter(source %in% Alt.tfs) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+
+# Plot
+pheatmap(top_Alt.acts_mat, border_color = NA, color=my_color, breaks = my_breaks) 
+```
+
+```{r Alt Ahr expression , fig.width = 13, fig.height = 4}
+Alt_Ahr_p1 <- DimPlot(Alt, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+Alt_Ahr_p2 <- (FeaturePlot(Alt, features = c("Ahr")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('AhR activity in Alt')
+DefaultAssay(object = Alt) <- "RNA"
+Alt_Ahr_p3 <- FeaturePlot(Alt, features = c("Ahr")) + ggtitle('Ahr expression in Alt')
+DefaultAssay(object = Alt) <- "tfswmean"
+
+plot_grid(Alt_Ahr_p1, Alt_Ahr_p2, Alt_Ahr_p3, nrow = 1, rel_widths = c(1, 1.3, 1.3))
+```
+
+```{r Alt Irf1 expression, fig.width = 13, fig.height = 4}
+Alt_Irf1_p1 <- DimPlot(Alt, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+Alt_Irf1_p2 <- (FeaturePlot(Alt, features = c("Irf1")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('IRF1 activity in Alt')
+DefaultAssay(object = Alt) <- "RNA"
+Alt_Irf1_p3 <- FeaturePlot(Alt, features = c("Irf1")) + ggtitle('Irf1 expression in Alt')
+DefaultAssay(object = Alt) <- "tfswmean"
+
+plot_grid(Alt_Irf1_p1, Alt_Irf1_p2, Alt_Irf1_p3, nrow = 1, rel_widths = c(1, 1.3, 1.3))
+```
+
+```{r Alt Myc expression, fig.width = 13, fig.height = 4}
+Alt_Myc_p1 <- DimPlot(Alt, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+Alt_Myc_p2 <- (FeaturePlot(Alt, features = c("Myc")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('MYC activity in Alt')
+DefaultAssay(object = Alt) <- "RNA"
+Alt_Myc_p3 <- FeaturePlot(Alt, features = c("Myc")) + ggtitle('Myc expression in Alt')
+DefaultAssay(object = Alt) <- "tfswmean"
+
+plot_grid(Alt_Myc_p1, Alt_Myc_p2, Alt_Myc_p2, nrow = 1, rel_widths = c(1, 1.3, 1.3))
+```
+
+
+# Exploration of the Alt.BPC TF activities
+
+```{r BPC TF exploration, fig.width = 12, fig.height = 4}
+# Extract activities from object as a long dataframe
+BPC.df <- t(as.matrix(BPC@assays$tfswmean@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(BPC)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Get top tfs with more variable means across clusters
+BPC.tfs <- BPC.df %>%
+  group_by(source) %>%
+  summarise(std = sd(mean)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+
+# Subset long data frame to top TFs and transform to wide matrix
+top_BPC.acts_mat <- BPC.df %>%
+  filter(source %in% BPC.tfs) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+
+# Plot
+pheatmap(top_BPC.acts_mat, border_color = NA, color=my_color, breaks = my_breaks)
+```
+
+```{r BPC Ahr expression , fig.width = 13, fig.height = 4}
+BPC_Ahr_p1 <- DimPlot(BPC, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+BPC_Ahr_p2 <- (FeaturePlot(BPC, features = c("Ahr")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('AhR activity in Alt.BPC')
+DefaultAssay(object = BPC) <- "RNA"
+BPC_Ahr_p3 <- FeaturePlot(BPC, features = c("Ahr")) + ggtitle('Ahr expression in Alt.BPC')
+DefaultAssay(object = BPC) <- "tfswmean"
+
+plot_grid(BPC_Ahr_p1, BPC_Ahr_p2, BPC_Ahr_p3, nrow = 1, rel_widths = c(1, 1.3, 1.3))
+```
+
+```{r BPC Irf1 expression , fig.width = 13, fig.height = 4}
+BPC_Irf1_p1 <- DimPlot(BPC, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+BPC_Irf1_p2 <- (FeaturePlot(BPC, features = c("Irf1")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('IRF1 activity in Alt.BPC')
+DefaultAssay(object = BPC) <- "RNA"
+BPC_Irf1_p3 <- FeaturePlot(BPC, features = c("Irf1")) + ggtitle('Irf1 expression in Alt.BPC')
+DefaultAssay(object = BPC) <- "tfswmean"
+
+plot_grid(BPC_Irf1_p1, BPC_Irf1_p2, BPC_Irf1_p3, nrow = 1, rel_widths = c(1, 1.3, 1.3))
+```
+
+```{r BPC Myc expression , fig.width = 13, fig.height = 4}
+BPC_Myc_p1 <- DimPlot(BPC, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+BPC_Myc_p2 <- (FeaturePlot(BPC, features = c("Myc")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('MYC activity in Alt.BPC')
+DefaultAssay(object = BPC) <- "RNA"
+BPC_Myc_p3 <- FeaturePlot(BPC, features = c("Myc")) + ggtitle('Myc expression in Alt.BPC')
+DefaultAssay(object = BPC) <- "tfswmean"
+
+plot_grid(BPC_Myc_p1, BPC_Myc_p2, BPC_Myc_p3, nrow = 1, rel_widths = c(1, 1.3, 1.3))
+```
+
+
+# Packages for external picture input
+
+```{r Load Image-Processing package}
+# Load Image-Processing package (magick)
+library(magick)
+```
+
+```{r Save the pheatmap}
+# Save the pheatmap
+pheatmap(top_BPC.acts_mat, border_color = NA, color=my_color, breaks = my_breaks, cellwidth = 14, cellheight = 14, fontsize = 10, main = 'Transcription Factor activity in Alt.BPC', filename = "BPC_TFs.pdf")
+```
+
+```{r Convert pdf to png}
+# Load pdf tp png conversion package 
+library(pdftools)
+
+pdf_convert(
+  "./BPC_TFs.pdf",
+  format = "png",
+  pages = NULL,
+  filenames = "BPC_TFs.png",
+  dpi = 600,
+  antialias = TRUE,
+  opw = "",
+  upw = "",
+  verbose = TRUE
+)
+```
+
+
+# Data oupput
+
+```{r TF activity for paper, fig.width = 12, fig.height = 10}
+# Input the conclusion picture
+BPC_TFs <- image_read("./BPC_TFs.png")
+
+figure7_A <- ggdraw() +
+  draw_image(BPC_TFs, scale = 1)
+
+
+# Generate the plot in paper figure form
+figure7_1 <- plot_grid(figure7_A, labels = c('(A)'), label_size = 18)
+figure7_2 <- plot_grid(Alt_Irf1_p2, Alt_Myc_p2, Alt_Ahr_p2, BPC_Irf1_p2, BPC_Myc_p2, BPC_Ahr_p2, labels = c('(B)', '(D)', '(F)', '(C)', '(E)', '(G)'), label_size = 18, nrow = 2, ncol = 3, rel_widths = c(1, 1, 1))
+
+figure7 <- plot_grid(figure7_1, figure7_2,
+                     nrow = 2,
+                     ncol = 1,
+                     rel_heights = c(1, 2)
+  )
+
+figure7
+```
+
+```{r Conclusion figure, fig.width = 6, fig.height = 6}
+conclusion <- image_read("./conclusion.png")
+
+figureS4 <- ggdraw() +
+  draw_image(conclusion, scale = 1)
+
+figureS4
+```
+
+
+# Data save
+
+```{r Output the figures}
+# Create a folder for the figures
+dir.create("./Figures", showWarnings = FALSE)
+
+# Save the figure
+ggsave2(plot = figure7, path = "./Figures", "Figure7.tiff", device = "tiff", dpi = 300, bg = "white", width = 11, height = 9, units = "in")
+ggsave2(plot = figureS4, path = "./Figures", "FigureS4.tiff", device = "tiff", dpi = 300, bg = "white", width = 6, height = 6, units = "in")
+```
+
+```{r Output the CSV files}
+# Create a folder for CSV files
+dir.create("./CSV", showWarnings = FALSE)
+
+# Export to csv
+write.csv(ILC.df.treatment, file.path("./CSV", "Alt+Alt.BPC_by_treatment_ILC_TF_activities.csv"))
+write.csv(ILC.df.cell_type, file.path("./CSV", "Alt+Alt.BPC_by_cell_type_ILC_TF_activities.csv"))
+write.csv(BPC.df, file.path("./CSV", "Alt.BPC_ILC_TF_activities.csv"))
+write.csv(Alt.df, file.path("./CSV", "Alt_ILC_TF_activities.csv"))
+```
+
+
+<details>
+  <summary>**Session Info**</summary>
+```{r sessionInfo}
+sessionInfo()
+```
+</details>
+
